@@ -100,6 +100,7 @@ async function sendSoft(event){
 }
 
 window.HELD_VIDEO_BUILD='v3-addTrack-2026-11-18';
+window.HELD_TURN_BUILD="v10.6-metered-turn";
 window.HELD_INTERACTION_BUILD='v10.2-ipad-hand-loader-2026-11-19';
 window.HELD_HAND_BUILD='v10.2-ipad-hand-loader-2026-11-19';
 window.HELD_EXPORT_BUILD='v9-minimal-preserves-v8.1-export';
@@ -205,9 +206,47 @@ async function toggleTrack(kind) {
   }catch(e){safeError(e);}
 }
 
-function initPC() {
+let pcInitPromise = null;
+async function initPC() {
   if(pc) return pc;
-  pc=new RTCPeerConnection({iceServers:[{urls:'stun:stun.l.google.com:19302'},{urls:'stun:stun1.l.google.com:19302'}]});
+  if(pcInitPromise) return pcInitPromise;
+  pcInitPromise=(async()=>{
+    const baseIceServers=[
+      {urls:'stun:stun.l.google.com:19302'},
+      {urls:'stun:stun1.l.google.com:19302'}
+    ];
+    const config=window.HELD_TURN_CONFIG || {};
+    let iceServers=baseIceServers;
+    if(config.credentialUrl){
+      const abortController=new AbortController();
+      const timeout=setTimeout(()=>abortController.abort(),9000);
+      try{
+        const response=await fetch(config.credentialUrl,{signal:abortController.signal,cache:'no-store'});
+        if(!response.ok) throw new Error('TURN credential service HTTP '+response.status);
+        const result=await response.json();
+        const external=Array.isArray(result)?result:result?.iceServers;
+        if(!Array.isArray(external) || !external.length) throw new Error('TURN credential service returned no ICE servers');
+        const valid=external.filter(entry=>entry && entry.urls &&
+          (Array.isArray(entry.urls) || typeof entry.urls==='string'));
+        const relayCount=valid.filter(entry=>
+          (Array.isArray(entry.urls)?entry.urls:[entry.urls]).some(url=>/^turns?:/i.test(url))).length;
+        if(!relayCount) throw new Error('TURN credential service returned no relay addresses');
+        iceServers=[...baseIceServers,...valid];
+        window.HELD_TURN_STATUS='READY';
+        console.info('[Held TURN] ready with',relayCount,'relay ICE entries');
+      }catch(error){
+        window.HELD_TURN_STATUS='ERROR: '+(error?.message||String(error));
+        console.error('[Held TURN] unable to obtain credentials:',error);
+        throw new Error('TURN setup failed: '+(error?.message||String(error)));
+      }finally{clearTimeout(timeout);}
+    }else{
+      window.HELD_TURN_STATUS='NOT CONFIGURED — STUN ONLY';
+      console.warn('[Held TURN] not configured; cross-network calls may fail');
+    }
+    pc=new RTCPeerConnection({
+      iceServers,
+      iceTransportPolicy:config.forceRelay===true && !!config.credentialUrl?'relay':'all'
+    });
   // ONLY the offerer (A) creates the initial audio/video m-lines.
   // If the answerer (B) creates local transceivers before receiving the offer,
   // Safari/Chrome may leave B's sending transceivers unassociated with A's
@@ -247,6 +286,8 @@ function initPC() {
     if(state==='failed')notify('Video network connection failed; try a different network or use a separate call. Shared drawing can still work.');
   };
   return pc;
+  })();
+  try {return await pcInitPromise;} finally {pcInitPromise=null;}
 }
 // After B accepts A's offer, bind B's actual media to the offered
 // audio/video m-lines BEFORE creating the answer. This prevents the
@@ -291,7 +332,7 @@ async function tryStartCall() {
   if(role!=='A' || offerMade)return;
   offerMade=true;
   try {
-    initPC();
+    await initPC();
     const offer=await pc.createOffer();
     await pc.setLocalDescription(offer);
     await sendSignal({type:'offer',sdp:pc.localDescription.toJSON()});
@@ -307,7 +348,7 @@ async function receiveSignal(signal){
   if(message.type==='color'){applyColorSignal(message,signal.sender,signal.id);return;}
   if(signal.sender===userId)return;
   if(message.type==='offer' && role==='B'){
-    initPC();
+    await initPC();
     if(pc.signalingState!=='stable')return;
     await pc.setRemoteDescription(message.sdp);
     await attachAnswererTracks();
@@ -322,7 +363,7 @@ async function receiveSignal(signal){
     await pc.setLocalDescription(answer);
     await sendSignal({type:'answer',sdp:pc.localDescription.toJSON()});
   }else if(message.type==='answer' && role==='A'){
-    initPC();
+    await initPC();
     if(pc.signalingState!=='have-local-offer')return;
     await pc.setRemoteDescription(message.sdp);
     await drainIce();
